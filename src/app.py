@@ -5,7 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import base64
+import hashlib
+import hmac
+import json
+import secrets
+import time
+from fastapi import FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
@@ -18,6 +25,112 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+TEACHERS_FILE = Path(os.environ.get("TEACHERS_FILE", str(current_dir / "teachers.json")))
+SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_urlsafe(32)
+SESSION_SECRET_BYTES = SESSION_SECRET.encode("utf-8")
+SESSION_COOKIE_NAME = "mergington_teacher_session"
+SESSION_TTL_SECONDS = 8 * 60 * 60
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() in {"1", "true", "yes"}
+PASSWORD_HASH_ITERATIONS = 310_000
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def load_teachers():
+    try:
+        teachers = json.loads(TEACHERS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("Unable to read teacher credentials") from error
+
+    if not isinstance(teachers, dict) or any(
+        not isinstance(username, str) or not isinstance(password_hash, str)
+        for username, password_hash in teachers.items()
+    ):
+        raise RuntimeError("Teacher credentials must be a JSON object of password hashes")
+    return teachers
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    )
+    encoded_salt = base64.urlsafe_b64encode(salt).decode("ascii")
+    encoded_hash = base64.urlsafe_b64encode(password_hash).decode("ascii")
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${encoded_salt}${encoded_hash}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations, encoded_salt, encoded_hash = encoded.split("$", 3)
+        iteration_count = int(iterations)
+        if algorithm != "pbkdf2_sha256" or not 100_000 <= iteration_count <= 1_000_000:
+            return False
+        salt = base64.urlsafe_b64decode(encoded_salt)
+        expected_hash = base64.urlsafe_b64decode(encoded_hash)
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, iteration_count
+        )
+        return hmac.compare_digest(actual_hash, expected_hash)
+    except (ValueError, TypeError):
+        return False
+
+
+DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(32))
+
+
+def create_session_token(username: str) -> str:
+    payload = json.dumps(
+        {"username": username, "expires_at": int(time.time()) + SESSION_TTL_SECONDS},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded_payload = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        SESSION_SECRET_BYTES, encoded_payload.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    return f"{encoded_payload}.{signature}"
+
+
+def authenticated_teacher(request: Request):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token or "." not in token:
+        return None
+
+    encoded_payload, signature = token.rsplit(".", 1)
+    expected_signature = hmac.new(
+        SESSION_SECRET_BYTES, encoded_payload.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        return None
+
+    try:
+        payload_bytes = base64.urlsafe_b64decode(
+            encoded_payload + "=" * (-len(encoded_payload) % 4)
+        )
+        payload = json.loads(payload_bytes)
+        username = payload["username"]
+        expires_at = int(payload["expires_at"])
+    except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+        return None
+
+    if not isinstance(username, str) or expires_at <= time.time():
+        return None
+    if username not in load_teachers():
+        return None
+    return username
+
+
+def require_teacher(request: Request):
+    username = authenticated_teacher(request)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
 
 # In-memory activity database
 activities = {
@@ -88,9 +201,51 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(credentials: LoginRequest, response: Response):
+    teachers = load_teachers()
+    stored_hash = teachers.get(credentials.username)
+    password_is_valid = verify_password(
+        credentials.password, stored_hash or DUMMY_PASSWORD_HASH
+    )
+    if stored_hash is None or not password_is_valid:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=create_session_token(credentials.username),
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+    return {"username": credentials.username}
+
+
+@app.get("/auth/session")
+def get_session(request: Request):
+    username = authenticated_teacher(request)
+    return {"authenticated": username is not None, "username": username}
+
+
+@app.post("/auth/logout")
+def logout(response: Response):
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +266,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    require_teacher(request)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
